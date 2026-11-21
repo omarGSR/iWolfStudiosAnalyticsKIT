@@ -142,7 +142,12 @@ public actor iWolfAnalyticsKIT {
         // Always persist before notifying the scheduler.
         try await queue.enqueue(event)
 
-        await syncScheduler?.eventEnqueued()
+        // Notify the scheduler without blocking track().
+        if let syncScheduler {
+            Task {
+                await syncScheduler.eventEnqueued()
+            }
+        }
     }
 
     // MARK: - Synchronization

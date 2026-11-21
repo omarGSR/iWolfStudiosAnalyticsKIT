@@ -138,6 +138,17 @@ public actor AnalyticsEventQueue {
         try persist(updatedEvents)
         events = updatedEvents
     }
+    
+    /// Removes all pending events from the persistent queue.
+    public func removeAll() throws {
+
+        guard !events.isEmpty else {
+            return
+        }
+
+        try persist([])
+        events.removeAll()
+    }
 
     // MARK: - Retry
 

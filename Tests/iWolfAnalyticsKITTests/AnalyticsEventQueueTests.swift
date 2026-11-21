@@ -35,6 +35,57 @@ struct AnalyticsEventQueueTests {
         #expect(events.count == 1)
         #expect(events.first?.event.id == event.id)
     }
+    
+    @Test("Remove all events persists an empty queue")
+    func testRemoveAllPersistence() async throws {
+
+        let directory = makeTemporaryDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        // Create the first queue.
+        let firstQueue = try AnalyticsEventQueue(
+            directoryURL: directory
+        )
+
+        // Enqueue multiple events.
+        try await firstQueue.enqueue(
+            AnalyticsEvent(eventName: "first")
+        )
+
+        try await firstQueue.enqueue(
+            AnalyticsEvent(eventName: "second")
+        )
+
+        try await firstQueue.enqueue(
+            AnalyticsEvent(eventName: "third")
+        )
+
+        #expect(await firstQueue.count() == 3)
+
+        // Remove all pending events.
+        try await firstQueue.removeAll()
+
+        // Verify the in-memory queue is empty.
+        #expect(await firstQueue.count() == 0)
+
+        // Create a new queue using the same directory.
+        // This simulates reopening the persistent storage.
+        let secondQueue = try AnalyticsEventQueue(
+            directoryURL: directory
+        )
+
+        // No events should be restored from disk.
+        #expect(await secondQueue.count() == 0)
+
+        // Verify the queue remains usable.
+        try await secondQueue.enqueue(
+            AnalyticsEvent(eventName: "new_event")
+        )
+
+        #expect(await secondQueue.count() == 1)
+    }
 
     @Test("Events maintain insertion order")
     func testEventOrder() async throws {

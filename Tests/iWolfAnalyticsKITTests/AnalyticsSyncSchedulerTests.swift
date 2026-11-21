@@ -122,55 +122,87 @@ struct AnalyticsSyncSchedulerTests {
 
     @Test("Stop and restart during an active request preserves pending events")
     func stopAndRestartDuringSync() async throws {
-
         let context = try makeContext(batchSize: 1)
         defer { context.cleanup() }
 
         SchedulerMockURLProtocol.configure(
-            mode: .accepted,
-            delay: 0.5
+            mode: .accepted
         )
 
+        SchedulerMockURLProtocol.holdResponses()
+
+        // Enqueue the first event.
         try await context.queue.enqueue(
             AnalyticsEvent(eventName: "first")
         )
 
+        // Start the first synchronization.
         let firstStart = Task {
             await context.scheduler.start()
         }
 
+        // Wait until the first HTTP request starts.
         let requestStarted = await waitUntil {
             SchedulerMockURLProtocol.requestCount == 1
         }
 
         #expect(requestStarted)
 
+        // The first HTTP request is still pending.
+        #expect(
+            SchedulerMockURLProtocol.maximumConcurrentRequests == 1
+        )
+
+        #expect(await context.queue.count() == 1)
+
+        // Stop the scheduler while HTTP is pending.
         await context.scheduler.stop()
 
+        // Enqueue another event.
         try await context.queue.enqueue(
             AnalyticsEvent(eventName: "second")
         )
 
-        await context.scheduler.start()
-        await firstStart.value
+        // Restart while the first HTTP request is still pending.
+        let restartTask = Task {
+            await context.scheduler.start()
+        }
 
+        // Give the restarted scheduler an opportunity to evaluate.
+        try await Task.sleep(for: .milliseconds(100))
+
+        // The manager must prevent overlapping HTTP requests.
+        #expect(
+            SchedulerMockURLProtocol.maximumConcurrentRequests == 1
+        )
+
+        // Release the first HTTP response.
+        SchedulerMockURLProtocol.releasePendingResponses()
+
+        // Wait for both scheduler evaluations.
+        await firstStart.value
+        await restartTask.value
+
+        // All pending events must eventually be synchronized.
         let completed = await waitUntil(timeout: 4) {
             await context.queue.count() == 0
         }
 
         #expect(completed)
 
+        // Both events must have been sent.
         #expect(
             SchedulerMockURLProtocol.requestCount >= 2
         )
 
+        // No overlapping HTTP requests should have occurred.
         #expect(
             SchedulerMockURLProtocol.maximumConcurrentRequests == 1
         )
 
         await context.scheduler.stop()
     }
-
+    
     @Test("Enqueuing during sync does not overlap HTTP requests")
     func eventEnqueuedDuringSync() async throws {
 
@@ -314,6 +346,52 @@ struct AnalyticsSyncSchedulerTests {
         await context.scheduler.stop()
     }
 
+    @Test("Permanent global error stops automatic synchronization")
+    func permanentErrorStopsAutomaticSync() async throws {
+        let context = try makeContext(batchSize: 1)
+        defer { context.cleanup() }
+
+        SchedulerMockURLProtocol.configure(mode: .invalidAppKey)
+
+        try await context.queue.enqueue(
+            AnalyticsEvent(eventName: "invalid_app_key")
+        )
+
+        await context.scheduler.start()
+
+        let stopped = await waitUntil {
+            let state = await context.manager.synchronizationState()
+            let count = await context.queue.count()
+            return state.isStopped && count == 0
+        }
+
+        #expect(stopped)
+        #expect(SchedulerMockURLProtocol.requestCount == 1)
+
+        // A newly queued event must not trigger another HTTP request.
+        try await context.queue.enqueue(
+            AnalyticsEvent(eventName: "after_stop")
+        )
+        await context.scheduler.eventEnqueued()
+        await context.scheduler.applicationDidBecomeActive()
+
+        try await Task.sleep(for: .milliseconds(250))
+
+        #expect(SchedulerMockURLProtocol.requestCount == 1)
+        #expect(await context.queue.count() == 1)
+
+        // Restarting only the scheduler must not resume a stopped manager.
+        await context.scheduler.stop()
+        await context.scheduler.start()
+
+        try await Task.sleep(for: .milliseconds(250))
+
+        #expect(SchedulerMockURLProtocol.requestCount == 1)
+        #expect(await context.queue.count() == 1)
+
+        await context.scheduler.stop()
+    }
+
     // MARK: - Helpers
 
     private func makeContext(
@@ -437,6 +515,7 @@ private final class SchedulerMockURLProtocol: URLProtocol,
     enum Mode: Sendable {
         case accepted
         case serverError
+        case invalidAppKey
         case keep
     }
 
@@ -447,6 +526,7 @@ private final class SchedulerMockURLProtocol: URLProtocol,
         var requestCount = 0
         var activeRequests = 0
         var maximumConcurrentRequests = 0
+        var pendingResponses: [@Sendable () -> Void] = []
 
         var mode: Mode = .accepted
         var delay: TimeInterval = 0
@@ -487,6 +567,26 @@ private final class SchedulerMockURLProtocol: URLProtocol,
             storage.maximumConcurrentRequests = 0
             storage.mode = .accepted
             storage.delay = 0
+            storage.pendingResponses.removeAll()
+        }
+    }
+    
+    static func holdResponses() {
+        storage.lock.withLock {
+            storage.delay = -1
+        }
+    }
+
+    static func releasePendingResponses() {
+        let responses = storage.lock.withLock {
+            let pending = storage.pendingResponses
+            storage.pendingResponses.removeAll()
+            storage.delay = 0
+            return pending
+        }
+
+        for response in responses {
+            response()
         }
     }
 
@@ -525,7 +625,11 @@ private final class SchedulerMockURLProtocol: URLProtocol,
             self?.deliver(mode: mode)
         }
 
-        if delay > 0 {
+        if delay < 0 {
+            Self.storage.lock.withLock {
+                Self.storage.pendingResponses.append(deliver)
+            }
+        } else if delay > 0 {
             DispatchQueue.global().asyncAfter(
                 deadline: .now() + delay,
                 execute: deliver
@@ -579,6 +683,11 @@ private final class SchedulerMockURLProtocol: URLProtocol,
                 }
             }
             """
+
+        case .invalidAppKey:
+
+            statusCode = 400
+            body = #"{"error":{"code":"invalid_app_key","message":"Invalid app key"}}"#
 
         case .keep:
 
@@ -701,3 +810,4 @@ private final class SchedulerMockURLProtocol: URLProtocol,
         return first["event_uuid"] as? String
     }
 }
+

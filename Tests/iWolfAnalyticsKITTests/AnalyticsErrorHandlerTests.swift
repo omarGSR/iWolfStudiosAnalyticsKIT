@@ -52,14 +52,14 @@ struct AnalyticsErrorHandlerTests {
         #expect(action == .reduceBatchSize)
     }
 
-    @Test("Invalid app key stops synchronization")
+    @Test("Invalid app key stops synchronization and clears queue")
     func testInvalidAppKey() {
         let action = AnalyticsGlobalErrorHandler.handle(
             statusCode: 400,
             errorCode: "invalid_app_key"
         )
 
-        #expect(action == .stop)
+        #expect(action == .stopAndClear)
     }
 
     @Test("Unknown global errors preserve the queue")

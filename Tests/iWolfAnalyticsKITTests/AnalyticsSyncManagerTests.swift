@@ -198,6 +198,191 @@ struct AnalyticsSyncManagerTests {
         await context.manager.sync()
         #expect(MockAnalyticsURLProtocol.requestCount == 1)
     }
+    
+    @Test("Invalid app key clears queue and stops synchronization")
+    func testInvalidAppKeyClearsQueue() async throws {
+        let context = try makeContext(
+            responses: ["invalid_app_key": .invalidAppKey],
+            batchSize: 1,
+            maxSimultaneousRequests: 1
+        )
+        defer { context.cleanup() }
+
+        // Enqueue multiple events.
+        for _ in 0..<3 {
+            try await context.queue.enqueue(
+                AnalyticsEvent(eventName: "invalid_app_key")
+            )
+        }
+
+        // First request returns invalid_app_key.
+        await context.manager.sync()
+
+        let state = await context.manager.synchronizationState()
+
+        // Synchronization must be stopped.
+        #expect(state.isStopped)
+
+        // All pending events must be removed.
+        #expect(await context.queue.count() == 0)
+
+        // No additional requests should be made.
+        #expect(MockAnalyticsURLProtocol.requestCount == 1)
+
+        // Further sync attempts must not send requests.
+        await context.manager.sync()
+
+        #expect(MockAnalyticsURLProtocol.requestCount == 1)
+    }
+    
+    @Test("Application not found clears queue and stops synchronization")
+    func testApplicationNotFoundClearsQueue() async throws {
+        let context = try makeContext(
+            responses: [
+                "application_not_found": .applicationNotFound
+            ],
+            batchSize: 1,
+            maxSimultaneousRequests: 1
+        )
+        defer { context.cleanup() }
+
+        // Enqueue multiple events.
+        for _ in 0..<3 {
+            try await context.queue.enqueue(
+                AnalyticsEvent(eventName: "application_not_found")
+            )
+        }
+
+        // First request returns application_not_found.
+        await context.manager.sync()
+
+        let state = await context.manager.synchronizationState()
+
+        // Synchronization must be stopped.
+        #expect(state.isStopped)
+
+        // All pending events must be removed.
+        #expect(await context.queue.count() == 0)
+
+        // Only one request should have been sent.
+        #expect(MockAnalyticsURLProtocol.requestCount == 1)
+
+        // Further sync attempts must not send requests.
+        await context.manager.sync()
+
+        #expect(MockAnalyticsURLProtocol.requestCount == 1)
+    }
+    
+    @Test("Permanent error first prevents additional batches")
+    func testStopAndClearErrorFirst() async throws {
+        let context = try makeContext(
+            responses: [
+                "invalid_event": .invalidAppKey,
+                "accepted_1": .accepted,
+                "accepted_2": .accepted,
+                "pending_event": .accepted
+            ],
+            batchSize: 2,
+            maxSimultaneousRequests: 3
+        )
+        defer { context.cleanup() }
+
+        MockAnalyticsURLProtocol.holdAllResponses()
+
+        for name in [
+            "invalid_event", "invalid_event_2",
+            "accepted_1", "accepted_1_2",
+            "accepted_2", "accepted_2_2",
+            "pending_event"
+        ] {
+            try await context.queue.enqueue(AnalyticsEvent(eventName: name))
+        }
+
+        let syncTask = Task { await context.manager.sync() }
+
+        do {
+            try await waitForRequestCount(3)
+            #expect(MockAnalyticsURLProtocol.requestCount == 3)
+
+            #expect(MockAnalyticsURLProtocol.releaseResponse(for: "invalid_event"))
+
+            // Give the manager time to observe the global failure before
+            // releasing successful responses. See note: timing-based check.
+            try await Task.sleep(for: .milliseconds(150))
+
+            #expect(MockAnalyticsURLProtocol.releaseResponse(for: "accepted_1"))
+            #expect(MockAnalyticsURLProtocol.releaseResponse(for: "accepted_2"))
+
+            await syncTask.value
+
+            let state = await context.manager.synchronizationState()
+            #expect(state.isStopped)
+            #expect(await context.queue.count() == 0)
+            #expect(MockAnalyticsURLProtocol.requestCount == 3)
+
+            await context.manager.sync()
+            #expect(MockAnalyticsURLProtocol.requestCount == 3)
+        } catch {
+            context.session.invalidateAndCancel()
+            syncTask.cancel()
+            await syncTask.value
+            throw error
+        }
+    }
+
+    @Test("Successful response can schedule a batch before permanent error")
+    func testStopAndClearSuccessFirst() async throws {
+        let context = try makeContext(
+            responses: [
+                "invalid_event": .invalidAppKey,
+                "accepted_1": .accepted,
+                "accepted_2": .accepted,
+                "pending_event": .accepted
+            ],
+            batchSize: 2,
+            maxSimultaneousRequests: 3
+        )
+        defer { context.cleanup() }
+
+        MockAnalyticsURLProtocol.holdAllResponses()
+
+        for name in [
+            "invalid_event", "invalid_event_2",
+            "accepted_1", "accepted_1_2",
+            "accepted_2", "accepted_2_2",
+            "pending_event"
+        ] {
+            try await context.queue.enqueue(AnalyticsEvent(eventName: name))
+        }
+
+        let syncTask = Task { await context.manager.sync() }
+
+        do {
+            try await waitForRequestCount(3)
+            #expect(MockAnalyticsURLProtocol.releaseResponse(for: "accepted_1"))
+            try await waitForRequestCount(4)
+            #expect(MockAnalyticsURLProtocol.requestCount == 4)
+
+            #expect(MockAnalyticsURLProtocol.releaseResponse(for: "invalid_event"))
+            #expect(MockAnalyticsURLProtocol.releaseResponse(for: "accepted_2"))
+            #expect(MockAnalyticsURLProtocol.releaseResponse(for: "pending_event"))
+
+            await syncTask.value
+
+            let state = await context.manager.synchronizationState()
+            #expect(state.isStopped)
+            #expect(await context.queue.count() == 0)
+            #expect(MockAnalyticsURLProtocol.requestCount == 4)
+
+            await context.manager.sync()
+            #expect(MockAnalyticsURLProtocol.requestCount == 4)
+        } catch {
+            context.session.invalidateAndCancel()
+            syncTask.cancel()
+            await syncTask.value
+            throw error
+        }
+    }
 
     @Test("HTTP 413 reduces effective batch size")
     func testHTTP413() async throws {
@@ -285,6 +470,19 @@ struct AnalyticsSyncManagerTests {
 
     // MARK: - Test Helpers
 
+    private func waitForRequestCount(
+        _ expected: Int,
+        timeout: Duration = .seconds(3)
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+
+        while MockAnalyticsURLProtocol.requestCount < expected {
+            guard clock.now < deadline else { throw URLError(.timedOut) }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
     private func enqueueTwoEvents(
         _ first: String,
         _ second: String,
@@ -354,6 +552,8 @@ private enum MockAnalyticsResponse: Sendable {
     case serverError
     case unauthorized
     case tooLarge
+    case invalidAppKey
+    case applicationNotFound
 
     var statusCode: Int {
         switch self {
@@ -361,6 +561,8 @@ private enum MockAnalyticsResponse: Sendable {
         case .serverError: 503
         case .unauthorized: 401
         case .tooLarge: 413
+        case .invalidAppKey: 400
+        case .applicationNotFound: 404
         }
     }
 
@@ -374,6 +576,11 @@ private enum MockAnalyticsResponse: Sendable {
             return #"{"error":{"code":"unauthorized","message":"Unauthorized"}}"#
         case .tooLarge:
             return #"{"error":{"code":"request_too_large","message":"Too large"}}"#
+        case .invalidAppKey:
+            return #"{"error":{"code":"invalid_app_key","message":"Invalid app key"}}"#
+
+        case .applicationNotFound:
+            return #"{"error":{"code":"application_not_found","message":"Application not found"}}"#
         }
     }
 }
@@ -384,9 +591,13 @@ private final class MockAnalyticsURLProtocol: URLProtocol {
         let lock = NSLock()
         var responses: [String: MockAnalyticsResponse] = [:]
         var requestCount = 0
+        var holdResponses = false
+        var pending: [String: [(MockAnalyticsURLProtocol, MockAnalyticsResponse)]] = [:]
     }
 
     private static let storage = Storage()
+    private let stateLock = NSLock()
+    private var cancelled = false
 
     static var requestCount: Int {
         storage.lock.lock()
@@ -399,15 +610,39 @@ private final class MockAnalyticsURLProtocol: URLProtocol {
         defer { storage.lock.unlock() }
         storage.responses = responses
         storage.requestCount = 0
+        storage.holdResponses = false
+        storage.pending.removeAll()
+    }
+
+    static func holdAllResponses() {
+        storage.lock.lock()
+        defer { storage.lock.unlock() }
+        storage.holdResponses = true
+    }
+
+    @discardableResult
+    static func releaseResponse(for eventName: String) -> Bool {
+        storage.lock.lock()
+        guard var entries = storage.pending[eventName], !entries.isEmpty else {
+            storage.lock.unlock()
+            return false
+        }
+        let entry = entries.removeFirst()
+        if entries.isEmpty {
+            storage.pending.removeValue(forKey: eventName)
+        } else {
+            storage.pending[eventName] = entries
+        }
+        storage.lock.unlock()
+        entry.0.deliver(entry.1)
+        return true
     }
 
     static func reset() {
         configure(responses: [:])
     }
 
-    override class func canInit(with request: URLRequest) -> Bool {
-        true
-    }
+    override class func canInit(with request: URLRequest) -> Bool { true }
 
     override class func canonicalRequest(for request: URLRequest) -> URLRequest {
         request
@@ -415,35 +650,44 @@ private final class MockAnalyticsURLProtocol: URLProtocol {
 
     override func startLoading() {
         let eventName = Self.firstEventName(in: request)
-
         Self.storage.lock.lock()
         Self.storage.requestCount += 1
         let mockResponse = Self.storage.responses[eventName]
+        let shouldHold = Self.storage.holdResponses
+        if let mockResponse, shouldHold {
+            Self.storage.pending[eventName, default: []].append((self, mockResponse))
+        }
         Self.storage.lock.unlock()
 
-        guard let mockResponse,
+        guard let mockResponse else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        if !shouldHold { deliver(mockResponse) }
+    }
+
+    override func stopLoading() {
+        stateLock.lock()
+        cancelled = true
+        stateLock.unlock()
+    }
+
+    private func deliver(_ mockResponse: MockAnalyticsResponse) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard !cancelled,
               let url = request.url,
               let response = HTTPURLResponse(
                 url: url,
                 statusCode: mockResponse.statusCode,
                 httpVersion: "HTTP/1.1",
                 headerFields: ["Content-Type": "application/json"]
-              ) else {
-            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
-            return
-        }
+              ) else { return }
 
-        client?.urlProtocol(
-            self,
-            didReceive: response,
-            cacheStoragePolicy: .notAllowed
-        )
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Data(mockResponse.body.utf8))
         client?.urlProtocolDidFinishLoading(self)
     }
-
-    override func stopLoading() {}
-
 
     private static func firstEventName(in request: URLRequest) -> String {
 

@@ -306,6 +306,66 @@ struct iWolfAnalyticsKITTests {
 
         await sdk.stopAutomaticSync()
     }
+    
+    @Test("Tracking does not wait for HTTP response")
+    func trackingDoesNotWaitForNetwork() async throws {
+
+        KITMockURLProtocol.reset()
+        KITMockURLProtocol.holdResponses()
+
+        let directory = try makeTemporaryDirectory()
+
+        defer {
+            KITMockURLProtocol.releasePendingResponses()
+            KITMockURLProtocol.reset()
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let queue = try AnalyticsEventQueue(
+            directoryURL: directory
+        )
+
+        let mock = makeMockClient()
+        defer { mock.session.invalidateAndCancel() }
+
+        let sdk = iWolfAnalyticsKIT(
+            queue: queue,
+            apiClient: mock.client
+        )
+
+        try await sdk.configure(
+            makeConfiguration(batchSize: 2)
+        )
+
+        // app_open is already persisted.
+        #expect(await queue.count() == 1)
+
+        // Completing the batch should trigger HTTP synchronization.
+        try await sdk.track("settings_opened")
+
+        // track() must return even while HTTP is pending.
+        #expect(await queue.count() == 2)
+
+        let requestStarted = await waitUntil {
+            KITMockURLProtocol.requestCount == 1
+        }
+
+        #expect(requestStarted)
+
+        // The server has not responded yet.
+        #expect(await queue.count() == 2)
+
+        // Allow HTTP synchronization to finish.
+        KITMockURLProtocol.releasePendingResponses()
+
+        let completed = await waitUntil {
+            await queue.count() == 0
+        }
+
+        #expect(completed)
+
+        await sdk.stopAutomaticSync()
+    }
 
     @Test("Stopping automatic sync preserves events until restarted")
     func stopAndRestartAutomaticSync() async throws {
@@ -367,9 +427,14 @@ private final class KITMockURLProtocol: URLProtocol {
 
         let lock = NSLock()
         var requestCount = 0
+        var shouldHoldResponses = false
+        var pendingResponses: [() -> Void] = []
     }
 
     private static let storage = Storage()
+    
+    private let responseLock = NSLock()
+    private var isCancelled = false
 
     static var requestCount: Int {
         storage.lock.withLock {
@@ -380,6 +445,28 @@ private final class KITMockURLProtocol: URLProtocol {
     static func reset() {
         storage.lock.withLock {
             storage.requestCount = 0
+            storage.shouldHoldResponses = false
+            storage.pendingResponses.removeAll()
+        }
+    }
+    
+    static func releasePendingResponses() {
+
+        let responses = storage.lock.withLock {
+            let pending = storage.pendingResponses
+            storage.pendingResponses.removeAll()
+            storage.shouldHoldResponses = false
+            return pending
+        }
+
+        for response in responses {
+            response()
+        }
+    }
+    
+    static func holdResponses() {
+        storage.lock.withLock {
+            storage.shouldHoldResponses = true
         }
     }
 
@@ -420,19 +507,48 @@ private final class KITMockURLProtocol: URLProtocol {
 
         let body = #"{"data":{"rejected":[]}}"#
 
-        client?.urlProtocol(
-            self,
-            didReceive: response,
-            cacheStoragePolicy: .notAllowed
-        )
+        let sendResponse = { [self] in
 
-        client?.urlProtocol(
-            self,
-            didLoad: Data(body.utf8)
-        )
+            let cancelled = responseLock.withLock {
+                isCancelled
+            }
 
-        client?.urlProtocolDidFinishLoading(self)
+            guard !cancelled else {
+                return
+            }
+
+            client?.urlProtocol(
+                self,
+                didReceive: response,
+                cacheStoragePolicy: .notAllowed
+            )
+
+            client?.urlProtocol(
+                self,
+                didLoad: Data(body.utf8)
+            )
+
+            client?.urlProtocolDidFinishLoading(self)
+        }
+
+        let shouldHold = Self.storage.lock.withLock {
+
+            if Self.storage.shouldHoldResponses {
+                Self.storage.pendingResponses.append(sendResponse)
+                return true
+            }
+
+            return false
+        }
+
+        if !shouldHold {
+            sendResponse()
+        }
     }
 
-    override func stopLoading() {}
+    override func stopLoading() {
+        responseLock.withLock {
+            isCancelled = true
+        }
+    }
 }

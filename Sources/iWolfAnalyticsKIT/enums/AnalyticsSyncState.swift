@@ -60,7 +60,7 @@ struct AnalyticsSyncState: Sendable {
 
             nextRetryAt = date.addingTimeInterval(delay)
 
-        case .stop:
+        case .stop, .stopAndClear:
             isStopped = true
             nextRetryAt = nil
 

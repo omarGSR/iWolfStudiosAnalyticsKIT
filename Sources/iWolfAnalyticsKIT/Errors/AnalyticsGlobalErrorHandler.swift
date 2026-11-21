@@ -15,6 +15,9 @@ enum AnalyticsGlobalErrorAction: Equatable, Sendable {
 
     /// Stop synchronization and preserve queued events.
     case stop
+    
+    /// Stop synchronization and discard all queued events.
+    case stopAndClear
 
     /// Retry with a smaller batch.
     case reduceBatchSize
@@ -66,13 +69,15 @@ enum AnalyticsGlobalErrorHandler {
              .rateLimitExceeded:
             return .retry
 
+        case .invalidAppKey,
+             .applicationNotFound:
+            return .stopAndClear
+
         case .invalidJson,
              .invalidRequest,
              .missingRequiredField,
              .invalidFieldValue,
              .invalidCountry,
-             .invalidAppKey,
-             .applicationNotFound,
              .unauthorized,
              .forbidden,
              .emptyEvents:

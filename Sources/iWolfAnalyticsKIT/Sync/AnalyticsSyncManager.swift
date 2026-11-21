@@ -213,7 +213,22 @@ actor AnalyticsSyncManager {
 
         // Apply one global action per synchronization cycle.
         if let priority = highestFailurePriority {
-            syncState.apply(priority.action)
+
+            if priority == .stopAndClear {
+                // Stop before clearing the queue.
+                syncState.apply(.stop)
+
+                do {
+                    try await queue.removeAll()
+                } catch {
+                    // Keep synchronization stopped if persistence fails.
+                    // Preserve the remaining events for investigation.
+                    return
+                }
+            } else {
+                syncState.apply(priority.action)
+            }
+
         } else if hadSuccessfulResponse {
             syncState.recordSuccess()
         }
@@ -231,12 +246,12 @@ actor AnalyticsSyncManager {
         case success
         case globalFailure(AnalyticsGlobalErrorAction)
     }
-
     
     private enum GlobalFailurePriority: Int {
         case retry = 1
         case reduceBatchSize = 2
         case stop = 3
+        case stopAndClear = 4
 
         init(_ action: AnalyticsGlobalErrorAction) {
             switch action {
@@ -246,6 +261,8 @@ actor AnalyticsSyncManager {
                 self = .reduceBatchSize
             case .stop:
                 self = .stop
+            case .stopAndClear:
+                self = .stopAndClear
             }
         }
 
@@ -257,6 +274,8 @@ actor AnalyticsSyncManager {
                 return .reduceBatchSize
             case .stop:
                 return .stop
+            case .stopAndClear:
+                return .stopAndClear
             }
         }
     }
