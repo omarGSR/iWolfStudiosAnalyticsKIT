@@ -157,6 +157,13 @@ public actor AnalyticsEventQueue {
         try persist(updatedEvents)
         events = updatedEvents
     }
+    
+    // MARK: - Oldest Event
+
+    /// Returns the enqueue date of the oldest pending event.
+    func oldestEnqueuedAt() -> Date? {
+        events.first?.enqueuedAt
+    }
 
     // MARK: - Count
 
@@ -164,6 +171,53 @@ public actor AnalyticsEventQueue {
     public func count() -> Int {
         events.count
     }
+    
+    
+    // MARK: - Batch Response
+
+    /// Applies individual event actions and persists the result
+    /// in a single operation.
+    ///
+    /// Temporary rejections increment retryCount.
+    /// Events reaching maxRetries are discarded.
+    func apply(
+        _ result: AnalyticsBatchProcessingResult,
+        maxRetries: Int
+    ) throws {
+
+        let retryLimit = max(0, maxRetries)
+
+        var updatedEvents: [QueuedAnalyticsEvent] = []
+
+        for var queuedEvent in events {
+
+            let id = queuedEvent.event.id
+
+            // Accepted or permanently rejected.
+            if result.removeIDs.contains(id) {
+                continue
+            }
+
+            // Temporarily rejected.
+            if result.retryIDs.contains(id) {
+
+                queuedEvent.incrementRetryCount()
+
+                if !queuedEvent.canRetry(
+                    maxRetries: retryLimit
+                ) {
+                    continue
+                }
+            }
+
+            // Keep all other events unchanged.
+            updatedEvents.append(queuedEvent)
+        }
+
+        try persist(updatedEvents)
+        events = updatedEvents
+    }
+
 
     // MARK: - Persistence
 

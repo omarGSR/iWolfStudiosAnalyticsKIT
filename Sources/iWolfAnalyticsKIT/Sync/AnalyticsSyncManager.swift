@@ -23,6 +23,8 @@ actor AnalyticsSyncManager {
     private var inFlightIDs = Set<UUID>()
     private var activeBatchCount = 0
 
+    private var syncState: AnalyticsSyncState
+
     // MARK: - Initialization
 
     init(
@@ -35,13 +37,26 @@ actor AnalyticsSyncManager {
         self.queue = queue
         self.apiClient = apiClient
         self.installationManager = installationManager
+
+        self.syncState = AnalyticsSyncState(
+            batchSize: configuration.batchSize
+        )
     }
 
+    
+    // MARK: - Testing Support
+
+    func synchronizationState() -> AnalyticsSyncState {
+        syncState
+    }
+
+    
     // MARK: - Synchronization
 
     func sync() async {
 
-        guard !isSyncing else {
+        guard !isSyncing,
+              syncState.canSync() else {
             return
         }
 
@@ -57,6 +72,10 @@ actor AnalyticsSyncManager {
         excluding excludedIDs: Set<UUID> = []
     ) async -> [[QueuedAnalyticsEvent]] {
 
+        guard syncState.canSync() else {
+            return []
+        }
+
         let availableSlots = max(
             0,
             configuration.maxSimultaneousRequests - activeBatchCount
@@ -66,14 +85,16 @@ actor AnalyticsSyncManager {
             return []
         }
 
+        let batchSize = syncState.effectiveBatchSize
+
         let pendingEvents = await queue.peek(
-            limit: configuration.batchSize * availableSlots,
+            limit: batchSize * availableSlots,
             excluding: inFlightIDs.union(excludedIDs)
         )
 
         let batches = AnalyticsBatchSelector.select(
             from: pendingEvents,
-            batchSize: configuration.batchSize,
+            batchSize: batchSize,
             maxBatches: availableSlots
         )
 
@@ -98,11 +119,15 @@ actor AnalyticsSyncManager {
             inFlightIDs.remove(queuedEvent.event.id)
         }
 
-        activeBatchCount = max(0, activeBatchCount - 1)
+        activeBatchCount = max(
+            0,
+            activeBatchCount - 1
+        )
     }
 
     // MARK: - Private
 
+ 
     private func performSync() async {
 
         let initialBatches = await reserveBatches()
@@ -111,15 +136,19 @@ actor AnalyticsSyncManager {
             return
         }
 
-        // Prevent failed or rejected batches from being sent
-        // repeatedly during the same synchronization cycle.
         var attemptedIDs = Set<UUID>()
 
         for batch in initialBatches {
-            attemptedIDs.formUnion(batch.map { $0.event.id })
+            attemptedIDs.formUnion(
+                batch.map { $0.event.id }
+            )
         }
-        
-        let installationUUID = await installationManager.installationUUID()
+
+        let installationUUID =
+            await installationManager.installationUUID()
+
+        var highestFailurePriority: GlobalFailurePriority?
+        var hadSuccessfulResponse = false
 
         await withTaskGroup(
             of: BatchTaskResult.self
@@ -135,15 +164,40 @@ actor AnalyticsSyncManager {
 
             while let result = await group.next() {
 
-                await processResult(result)
+                let outcome = await processResult(result)
+
+                switch outcome {
+
+                case .success:
+                    hadSuccessfulResponse = true
+
+                case .globalFailure(let action):
+
+                    let priority = GlobalFailurePriority(action)
+
+                    if let current = highestFailurePriority {
+                        if priority.rawValue > current.rawValue {
+                            highestFailurePriority = priority
+                        }
+                    } else {
+                        highestFailurePriority = priority
+                    }
+                }
 
                 releaseBatch(result.batch)
+
+                // Stop scheduling new batches after the first
+                // global failure, but drain in-flight requests.
+                guard highestFailurePriority == nil else {
+                    continue
+                }
 
                 let nextBatches = await reserveBatches(
                     excluding: attemptedIDs
                 )
 
                 for batch in nextBatches {
+
                     attemptedIDs.formUnion(
                         batch.map { $0.event.id }
                     )
@@ -156,13 +210,55 @@ actor AnalyticsSyncManager {
                 }
             }
         }
+
+        // Apply one global action per synchronization cycle.
+        if let priority = highestFailurePriority {
+            syncState.apply(priority.action)
+        } else if hadSuccessfulResponse {
+            syncState.recordSuccess()
+        }
     }
+
 
     // MARK: - Sending
 
     private struct BatchTaskResult: Sendable {
         let batch: [QueuedAnalyticsEvent]
         let result: Result<AnalyticsAPIResult, Error>
+    }
+
+    private enum BatchProcessingOutcome {
+        case success
+        case globalFailure(AnalyticsGlobalErrorAction)
+    }
+
+    
+    private enum GlobalFailurePriority: Int {
+        case retry = 1
+        case reduceBatchSize = 2
+        case stop = 3
+
+        init(_ action: AnalyticsGlobalErrorAction) {
+            switch action {
+            case .retry:
+                self = .retry
+            case .reduceBatchSize:
+                self = .reduceBatchSize
+            case .stop:
+                self = .stop
+            }
+        }
+
+        var action: AnalyticsGlobalErrorAction {
+            switch self {
+            case .retry:
+                return .retry
+            case .reduceBatchSize:
+                return .reduceBatchSize
+            case .stop:
+                return .stop
+            }
+        }
     }
 
     private func addBatch(
@@ -179,11 +275,17 @@ actor AnalyticsSyncManager {
             let analyticsBatch = AnalyticsBatch(
                 appKey: configuration.appKey,
                 installationUUID: installationUUID,
+                appVersion: AnalyticsDeviceInfo.appVersion,
+                osVersion: AnalyticsDeviceInfo.osVersion,
+                country: AnalyticsDeviceInfo.country,
+                deviceIdentifier: AnalyticsDeviceInfo.deviceIdentifier,
                 events: batch.map { $0.event }
             )
 
             do {
-                let response = try await apiClient.send(analyticsBatch)
+                let response = try await apiClient.send(
+                    analyticsBatch
+                )
 
                 return BatchTaskResult(
                     batch: batch,
@@ -203,7 +305,7 @@ actor AnalyticsSyncManager {
 
     private func processResult(
         _ result: BatchTaskResult
-    ) async {
+    ) async -> BatchProcessingOutcome {
 
         switch result.result {
 
@@ -213,30 +315,52 @@ actor AnalyticsSyncManager {
 
             case .success(let apiResponse):
 
-                // Partial rejection handling comes next.
-                // For now, only accept batches with no rejections.
-                guard apiResponse.data.rejected.isEmpty else {
-                    return
+                guard let processingResult =
+                    AnalyticsBatchResponseProcessor.process(
+                        batch: result.batch,
+                        response: apiResponse
+                    )
+                else {
+                    // Invalid HTTP 200 response.
+                    // Preserve all events.
+                    return .globalFailure(.retry)
                 }
-
-                let acceptedIDs = Set(
-                    result.batch.map { $0.event.id }
-                )
 
                 do {
-                    try await queue.remove(ids: acceptedIDs)
+                    try await queue.apply(
+                        processingResult,
+                        maxRetries: configuration.maxRetries
+                    )
+
+                    return .success
+
                 } catch {
-                    // Events remain in the persistent queue.
+                    // Persistence failed.
+                    // Preserve the queue.
+                    return .globalFailure(.retry)
                 }
 
-            case .httpError:
-                // Global error handling comes next.
-                break
+            case .httpError(
+                let statusCode,
+                let errorCode,
+                _,
+                _
+            ):
+
+                let action = AnalyticsGlobalErrorHandler.handle(
+                    statusCode: statusCode,
+                    errorCode: errorCode
+                )
+
+                return .globalFailure(action)
             }
 
         case .failure:
-            // Network errors remain queued for a future sync.
-            break
+
+            // Network or decoding failure.
+            // Event retry counters remain unchanged.
+            return .globalFailure(.retry)
         }
     }
+
 }
