@@ -45,11 +45,9 @@ struct AnalyticsAPIClient: Sendable {
         _ batch: AnalyticsBatch
     ) async throws -> AnalyticsAPIResult {
 
-        let url = baseURL
-            .appendingPathComponent("api")
-            .appendingPathComponent("v1")
-            .appendingPathComponent("events")
-            .appendingPathComponent("batch")
+        let url = AnalyticsEndpoint.eventsBatch.url(
+            baseURL: baseURL
+        )
 
         var request = URLRequest(url: url)
 

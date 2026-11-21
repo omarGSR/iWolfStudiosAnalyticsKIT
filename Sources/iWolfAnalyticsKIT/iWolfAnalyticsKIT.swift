@@ -14,9 +14,11 @@ public actor iWolfAnalyticsKIT {
     // MARK: - Dependencies
 
     private let injectedQueue: AnalyticsEventQueue?
+    private let injectedAPIClient: AnalyticsAPIClient?
 
     private var queue: AnalyticsEventQueue?
     private var syncManager: AnalyticsSyncManager?
+    private var syncScheduler: AnalyticsSyncScheduler?
 
     // MARK: - State
 
@@ -25,21 +27,25 @@ public actor iWolfAnalyticsKIT {
 
     private init() {
         self.injectedQueue = nil
+        self.injectedAPIClient = nil
     }
 
     /// Creates an isolated SDK instance for testing.
-    internal init(queue: AnalyticsEventQueue) {
+    internal init(
+        queue: AnalyticsEventQueue,
+        apiClient: AnalyticsAPIClient? = nil
+    ) {
         self.injectedQueue = queue
+        self.injectedAPIClient = apiClient
     }
 
-    
     // MARK: - Configuration
 
     /// Configures the SDK once per application process.
     ///
     /// Concurrent callers wait for the same initialization task.
     /// Automatically persists one app_open event.
-    /// No network request is performed during configuration.
+    /// Starts the automatic synchronization scheduler.
     public func configure(
         _ configuration: AnalyticsConfiguration
     ) async throws {
@@ -66,7 +72,7 @@ public actor iWolfAnalyticsKIT {
                 queue = try AnalyticsEventQueue()
             }
 
-            let apiClient = AnalyticsAPIClient(
+            let apiClient = injectedAPIClient ?? AnalyticsAPIClient(
                 baseURL: configuration.baseURL
             )
 
@@ -79,7 +85,12 @@ public actor iWolfAnalyticsKIT {
                 installationManager: installationManager
             )
 
-            // Persist app_open before completing initialization.
+            let syncScheduler = AnalyticsSyncScheduler(
+                queue: queue,
+                syncManager: syncManager
+            )
+
+            // Persist app_open before starting the scheduler.
             let appOpenEvent = AnalyticsEvent(
                 eventName: "app_open"
             )
@@ -88,6 +99,11 @@ public actor iWolfAnalyticsKIT {
 
             self.queue = queue
             self.syncManager = syncManager
+            self.syncScheduler = syncScheduler
+
+            // Enable automatic synchronization.
+            await syncScheduler.start()
+
             self.isConfigured = true
         }
 
@@ -102,12 +118,11 @@ public actor iWolfAnalyticsKIT {
         }
     }
 
-
     // MARK: - Tracking
 
     /// Persists an analytics event in the local queue.
     ///
-    /// Events are not sent immediately.
+    /// The scheduler decides when to synchronize.
     public func track(
         _ eventName: String,
         sessionUUID: UUID? = nil,
@@ -124,12 +139,18 @@ public actor iWolfAnalyticsKIT {
             metadata: metadata
         )
 
+        // Always persist before notifying the scheduler.
         try await queue.enqueue(event)
+
+        await syncScheduler?.eventEnqueued()
     }
 
     // MARK: - Synchronization
 
     /// Manually synchronizes pending events.
+    ///
+    /// Manual synchronization is not restricted by the
+    /// scheduler's event count or timing policy.
     public func sync() async throws {
 
         guard let syncManager else {
@@ -137,6 +158,38 @@ public actor iWolfAnalyticsKIT {
         }
 
         await syncManager.sync()
+    }
+
+    // MARK: - Application Lifecycle
+
+    /// Re-evaluates pending events when the app becomes active.
+    public func applicationDidBecomeActive() async {
+
+        guard isConfigured else {
+            return
+        }
+
+        await syncScheduler?.applicationDidBecomeActive()
+    }
+
+    /// Stops automatic synchronization.
+    ///
+    /// Does not remove persisted events.
+    public func stopAutomaticSync() async {
+
+        await syncScheduler?.stop()
+    }
+
+    /// Restarts automatic synchronization.
+    ///
+    /// Pending events are evaluated again.
+    public func startAutomaticSync() async {
+
+        guard isConfigured else {
+            return
+        }
+
+        await syncScheduler?.start()
     }
 }
 

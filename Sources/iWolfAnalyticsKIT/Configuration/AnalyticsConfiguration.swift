@@ -17,8 +17,10 @@ public struct AnalyticsConfiguration: Sendable {
     public let maxSimultaneousRequests: Int
 
     public init(
-        baseURL: URL,
-        appKey: String,
+        baseURL: URL = URL(
+            string: "https://api.iwolfstudios.io"
+        )!,
+        appKey: String = Bundle.main.bundleIdentifier ?? "",
         batchSize: Int = AnalyticsLimits.defaultBatchEvents,
         maxRetries: Int = AnalyticsLimits.defaultRetries,
         maxSimultaneousRequests: Int = AnalyticsLimits.defaultSimultaneousRequests
