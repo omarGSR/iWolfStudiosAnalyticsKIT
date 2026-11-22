@@ -38,11 +38,11 @@ actor AnalyticsSyncScheduler {
     init(
         queue: AnalyticsEventQueue,
         syncManager: AnalyticsSyncManager,
-        policy: AnalyticsSyncPolicy = AnalyticsSyncPolicy()
+        configuration: AnalyticsConfiguration
     ) {
         self.queue = queue
         self.syncManager = syncManager
-        self.policy = policy
+        self.policy = AnalyticsSyncPolicy(configuration: configuration)
     }
 
     // MARK: - Lifecycle
@@ -65,6 +65,30 @@ actor AnalyticsSyncScheduler {
         nextAttemptNotBefore = nil
 
         cancelScheduledTask()
+    }
+    
+    func syncIfNeeded(minEvents: Int = 1) async {
+        guard isRunning, minEvents > 0 else {
+            return
+        }
+
+        let currentGeneration = generation
+        let pendingCount = await queue.count()
+
+        guard isValid(currentGeneration),
+              pendingCount >= minEvents else {
+            return
+        }
+
+        let state = await syncManager.synchronizationState()
+
+        guard isValid(currentGeneration),
+              state.canSync(at: Date()) else {
+            return
+        }
+
+        await syncManager.sync()
+        await requestEvaluation()
     }
 
     // MARK: - Events

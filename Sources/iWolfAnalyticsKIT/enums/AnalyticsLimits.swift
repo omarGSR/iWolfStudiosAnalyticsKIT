@@ -33,10 +33,10 @@ public enum AnalyticsLimits {
     
     // Policy Sync
     
-    /// Send every 3 minutes if the queue has at least minEventsToSync events.
-    public static let syncInterval: TimeInterval = 3 * 60
-    public static let minEventsToSync: Int = 3
+    /// Send every 5 minutes if the queue has at least minEventsToSync events.
+    public static let defaultSchedulerSyncInterval: TimeInterval = 5 * 60
+    public static let defaultSchedulerMinEventsToSync: Int = 3
     
-    /// Force synchronization after 15 minutes for small queues
-    public static let forcedSyncInterval: TimeInterval = 15 * 60
+    /// Force synchronization after 20 minutes for small queues
+    public static let defaultForcedSyncMaxInterval: TimeInterval = 20 * 60
 }

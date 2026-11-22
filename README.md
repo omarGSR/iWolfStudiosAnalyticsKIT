@@ -43,6 +43,31 @@ try await iWolfAnalyticsKIT.shared.configure(configuration)
 
 La URL anterior es el valor por defecto observado en `AnalyticsConfiguration`; confirma la URL definitiva del entorno antes del despliegue.
 
+### Configuración personalizada
+
+El SDK permite personalizar el tamaño de los lotes, los reintentos, la concurrencia y los intervalos de sincronización automática.
+
+```swift
+let configuration = AnalyticsConfiguration(
+    baseURL: URL(string: "https://api.iwolfstudios.io")!,
+    appKey: Bundle.main.bundleIdentifier ?? "",
+    batchSize: 20,
+    maxRetries: 4,
+    maxSimultaneousRequests: 2,
+    syncIntervalScheduler: 5 * 60,
+    minEventsToSyncScheduler: 3,
+    forcedSyncIntervalScheduler: 20 * 60
+)
+
+try await iWolfAnalyticsKIT.shared.configure(configuration)
+```
+
+Los intervalos se expresan en segundos. Los parámetros se validan automáticamente para mantenerse dentro de los límites admitidos.
+
+La política automática intenta sincronizar cuando se alcanza el tamaño del batch, cuando hay suficientes eventos pendientes durante la comprobación periódica o cuando se alcanza el intervalo de sincronización forzada.
+
+Una llamada manual a `sync()` no requiere alcanzar el mínimo de eventos, aunque sigue respetando las restricciones del estado de sincronización.
+
 ## Registrar eventos
 
 ```swift

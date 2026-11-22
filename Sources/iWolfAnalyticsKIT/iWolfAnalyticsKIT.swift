@@ -87,7 +87,8 @@ public actor iWolfAnalyticsKIT {
 
             let syncScheduler = AnalyticsSyncScheduler(
                 queue: queue,
-                syncManager: syncManager
+                syncManager: syncManager,
+                configuration: configuration
             )
 
             // Persist app_open before starting the scheduler.
@@ -100,11 +101,14 @@ public actor iWolfAnalyticsKIT {
             self.queue = queue
             self.syncManager = syncManager
             self.syncScheduler = syncScheduler
+            
+            self.isConfigured = true
 
             // Enable automatic synchronization.
             await syncScheduler.start()
 
-            self.isConfigured = true
+            // Sync if there are events from a previous execution. We use two becouse the we just added a "app_open"
+            await syncScheduler.syncIfNeeded(minEvents: 2)
         }
 
         configurationTask = task

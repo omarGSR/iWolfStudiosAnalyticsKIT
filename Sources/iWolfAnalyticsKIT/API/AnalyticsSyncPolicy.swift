@@ -15,17 +15,10 @@ struct AnalyticsSyncPolicy: Sendable {
     let minEventsToSync: Int
     let forcedSyncInterval: TimeInterval
 
-    init(
-        syncInterval: TimeInterval = AnalyticsLimits.syncInterval,
-        minEventsToSync: Int = AnalyticsLimits.minEventsToSync,
-        forcedSyncInterval: TimeInterval = AnalyticsLimits.forcedSyncInterval
-    ) {
-        self.syncInterval = max(1, syncInterval)
-        self.minEventsToSync = max(1, minEventsToSync)
-        self.forcedSyncInterval = max(
-            self.syncInterval,
-            forcedSyncInterval
-        )
+    init(configuration: AnalyticsConfiguration) {
+        self.syncInterval = configuration.syncIntervalScheduler
+        self.minEventsToSync = configuration.minEventsToSyncScheduler
+        self.forcedSyncInterval = configuration.forcedSyncIntervalScheduler
     }
 
     /// Evaluates whether an automatic sync is due.
