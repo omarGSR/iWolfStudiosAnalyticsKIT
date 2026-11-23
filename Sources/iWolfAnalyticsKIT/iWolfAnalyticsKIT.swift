@@ -97,6 +97,12 @@ public actor iWolfAnalyticsKIT {
             )
 
             try await queue.enqueue(appOpenEvent)
+            
+            // Check app update
+            if let appUpdateEvent = await installationManager.needsAppUpdate() {
+                try await queue.enqueue(appUpdateEvent)
+                await installationManager.confirmAppVersion()
+            }
 
             self.queue = queue
             self.syncManager = syncManager
